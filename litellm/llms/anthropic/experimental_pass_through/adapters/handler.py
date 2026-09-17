@@ -37,6 +37,105 @@ if TYPE_CHECKING:
 # Anthropic-only keys already mapped by the translator; strip on extra_kwargs re-merge.
 ANTHROPIC_ONLY_REQUEST_KEYS: Final[frozenset[str]] = frozenset({"output_config"})
 
+# Anthropic-native surfaces where a trailing assistant message (client
+# prefill) is documented API semantics. Only structurally-certain entries
+# belong here — adding a name requires evidence (probe result or backend
+# docs) that it accepts trailing-assistant prefill. Every other provider,
+# including unknown ones, defaults to normalization: over-normalizing costs
+# a semantic approximation, missing one costs a 400.
+_ASSISTANT_PREFILL_TOLERANT_PROVIDERS: Final = frozenset(
+    {
+        "anthropic",
+        "bedrock",
+        "vertex_ai",
+    }
+)
+
+# Appended after a visible-text trailing assistant. The resulting
+# [assistant(text), user(continue)] tail is a probe-verified accepted shape
+# (round2 A6 / round3 D10). Rewriting the assistant text into a user turn
+# instead would (a) fabricate consecutive user turns when the previous
+# message is also a user turn — a shape never probed upstream — and
+# (b) misattribute the model's own partial output to the user.
+_SYNTHETIC_CONTINUATION_PROMPT: Final = "Continue from where you left off."
+
+
+def _assistant_tail_has_visible_text(content: object) -> bool:
+    """str content: non-whitespace check. list content (OpenAI content-parts
+    form, emitted by the translator when text blocks carry cache_control):
+    any non-whitespace text part."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+            and part.get("text").strip()
+            for part in content
+        )
+    return False
+
+
+def _normalize_trailing_assistant_for_prefill_intolerant_providers(
+    messages: list[dict],
+    custom_llm_provider: str | None,
+) -> list[dict]:
+    """Neutralize a trailing assistant message that an OpenAI-compat backend
+    would turn into a rejected assistant prefill (upstream 11133/11153).
+
+    Rules (empirically derived from differential probing):
+    - tolerant provider (native Anthropic-family surface) -> unchanged
+    - tail is not an assistant message -> unchanged
+    - tail assistant has tool_calls -> unchanged (F3 handles it separately;
+      rewriting here would corrupt tool-call/result pairing)
+    - tail assistant content is null / "" / whitespace / empty or
+      all-whitespace block list -> drop the message (carries nothing;
+      strict backends accept it but dropping is strictly safer)
+    - tail assistant has visible text (str or content-parts list) -> keep
+      it and append a synthetic user continuation turn: the sequence no
+      longer ends with an assistant (11133/11153 trigger removed),
+      turn alternation is preserved, and authorship of the partial output
+      stays with the assistant
+    """
+    if custom_llm_provider in _ASSISTANT_PREFILL_TOLERANT_PROVIDERS:
+        return messages
+    if not messages:
+        return messages
+    tail = messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "assistant":
+        return messages
+    if tail.get("tool_calls"):
+        return messages
+    if _assistant_tail_has_visible_text(tail.get("content")):
+        return [*messages, {"role": "user", "content": _SYNTHETIC_CONTINUATION_PROMPT}]
+    return messages[:-1]
+
+
+def _deployment_tool_choice_string_only(model_info: object) -> bool:
+    """Whether this deployment's backend unmarshals tool_choice as a plain
+    string and rejects the OpenAI object form. Declared per deployment via
+    ``model_info.tool_choice_string_only: true`` in config.yaml; the router
+    plumbs it through kwargs["model_info"].
+    """
+    if not isinstance(model_info, dict):
+        return False
+    return model_info.get("tool_choice_string_only") is True
+
+
+def _flatten_tool_choice_for_string_only_deployments(
+    tool_choice: object,
+    string_only: bool,
+) -> object:
+    """String-only backends cannot decode the OpenAI object form
+    ({"type":"function","function":{...}}); flatten to "required" (the
+    forced-tool semantic minus the specific-tool pin, which a string
+    cannot express). Untagged deployments keep the object form.
+    """
+    if not string_only or not isinstance(tool_choice, dict):
+        return tool_choice
+    return "required"
+
 _AnthropicMessages: TypeAlias = "list[dict[str, object]]"
 _AnthropicSystem: TypeAlias = "str | list[dict[str, object]] | None"
 _ContextManagementSpec: TypeAlias = "dict[str, object] | list[dict[str, object]] | None"
@@ -546,6 +645,21 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             completion_kwargs,
             thinking=thinking,
         )
+
+        completion_kwargs["messages"] = _normalize_trailing_assistant_for_prefill_intolerant_providers(
+            cast(list[dict], completion_kwargs.get("messages") or []),
+            custom_llm_provider if isinstance(custom_llm_provider, str) else None,
+        )
+
+        _tc = completion_kwargs.get("tool_choice")
+        if _tc is not None:
+            _mi = extra_kwargs.get("model_info")
+            if not isinstance(_mi, dict):
+                _mi = extra_kwargs.get("litellm_metadata", {}).get("model_info") if isinstance(extra_kwargs.get("litellm_metadata"), dict) else None
+            completion_kwargs["tool_choice"] = _flatten_tool_choice_for_string_only_deployments(
+                _tc,
+                _deployment_tool_choice_string_only(_mi),
+            )
 
         return completion_kwargs, tool_name_mapping
 
